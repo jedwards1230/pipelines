@@ -101,6 +101,7 @@ jobs:
                   retention-days: 1
 
     build-cuda-image:
+        if: false
         runs-on: ubuntu-latest
         permissions:
             contents: read
