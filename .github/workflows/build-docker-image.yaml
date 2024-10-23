@@ -25,10 +25,6 @@ on:
                 required: false
                 default: ghcr.io
                 type: string
-            extract_flavor:
-                required: false
-                default: ""
-                type: string
 
 env:
     FULL_IMAGE_NAME: ${{ inputs.registry }}/${{ inputs.image_name }}
