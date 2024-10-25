@@ -54,15 +54,25 @@ reset_pipelines_dir() {
 
 # Function to install requirements if requirements.txt is provided
 install_requirements() {
-  if [[ -f "$1" ]]; then
-    echo "requirements.txt found at $1. Installing requirements..."
-    if [ "$DEBUG_PIP" = true ]; then
-      pip install -r "$1" || { echo "Failed to install requirements from $1"; exit 1; }
+  local req_file="$1"
+  local source="$2"
+  if [[ -f "$req_file" ]]; then
+    if [ -n "$source" ]; then
+      echo "Installing requirements from $source..."
     else
-      pip install -r "$1" --quiet >/dev/null 2>&1 || { echo "Failed to install requirements from $1"; exit 1; }
+      echo "requirements.txt found at $req_file. Installing requirements..."
+    fi
+    if [ "$DEBUG_PIP" = true ]; then
+      pip install -r "$req_file" || { echo "Failed to install requirements from $source"; exit 1; }
+    else
+      pip install -r "$req_file" --quiet >/dev/null 2>&1 || { echo "Failed to install requirements from $source"; exit 1; }
     fi
   else
-    echo "requirements.txt not found at $1. Skipping installation of requirements."
+    if [ -n "$source" ]; then
+      echo "No requirements found in $source. Skipping installation of requirements."
+    else
+      echo "requirements.txt not found at $req_file. Skipping installation of requirements."
+    fi
   fi
 }
 
@@ -79,16 +89,25 @@ download_pipelines() {
   if [[ "$path" =~ ^https://github.com/.*/.*/blob/.* ]]; then
     # It's a single file
     dest_file=$(basename "$path")
-    curl -L "$path?raw=true" -o "$destination/$dest_file" || { echo "Failed to download $path"; exit 1; }
+    raw_url="${path/\/blob\//\/raw\/}"
+    curl -L "$raw_url" -o "$destination/$dest_file" || { echo "Failed to download $path"; exit 1; }
   elif [[ "$path" =~ ^https://github.com/.*/.*/tree/.* ]]; then
     # It's a folder
-    git_repo=$(echo "$path" | awk -F '/tree/' '{print $1}')
-    subdir=$(echo "$path" | awk -F '/tree/' '{print $2}')
-    git clone --depth 1 --filter=blob:none --sparse "$git_repo" "$destination" || { echo "Failed to clone $git_repo"; exit 1; }
+    git_repo=$(echo "$path" | awk -F '/tree/' '{print $1}').git
+    after_tree=$(echo "$path" | awk -F '/tree/' '{print $2}')
+    branch_name=$(echo "$after_tree" | cut -d'/' -f1)
+    subdir=$(echo "$after_tree" | cut -d'/' -f2-)
+
+    temp_dir=$(mktemp -d)
+    git clone --depth 1 --filter=blob:none --sparse -b "$branch_name" "$git_repo" "$temp_dir" || { echo "Failed to clone $git_repo"; exit 1; }
     (
-      cd "$destination" || exit
+      cd "$temp_dir" || exit
+      git sparse-checkout init --cone
       git sparse-checkout set "$subdir"
     )
+    mkdir -p "$destination"
+    mv "$temp_dir/$subdir/"* "$destination/" || { echo "Failed to move files from $temp_dir/$subdir to $destination"; exit 1; }
+    rm -rf "$temp_dir"
   elif [[ "$path" =~ ^https://github.com/.*/.*/archive/.*\.zip$ ]]; then
     curl -L "$path" -o "$destination/archive.zip" || { echo "Failed to download $path"; exit 1; }
     unzip "$destination/archive.zip" -d "$destination" || { echo "Failed to unzip archive.zip"; exit 1; }
@@ -109,22 +128,25 @@ download_pipelines() {
 # Function to parse and install requirements from frontmatter
 install_frontmatter_requirements() {
   local file="$1"
-  local file_content=$(cat "$file")
+  local file_content
+  file_content=$(cat "$file")
   # Extract the first triple-quoted block
-  local first_block=$(echo "$file_content" | awk '/"""/{flag=!flag; if(flag) count++; if(count == 2) {exit}} flag')
-
+  local first_block
+  first_block=$(echo "$file_content" | awk '/"""/{flag=!flag; if(flag) count++; if(count == 2) {exit}} flag')
   # Find the line containing 'requirements:'
-  local requirements_line=$(echo "$first_block" | grep -i 'requirements:')
+  local requirements_line
+  requirements_line=$(echo "$first_block" | grep -i 'requirements:')
 
   if [ -n "$requirements_line" ]; then
     # Extract and process the requirements list
-    local requirements=$(echo "$requirements_line" | awk -F': ' '{print $2}' | tr ',' ' ' | tr -d '\r' | xargs)
-
-    echo "Installing requirements: $requirements"
+    local requirements
+    requirements=$(echo "$requirements_line" | awk -F': ' '{print $2}' | tr ',' ' ' | tr -d '\r' | xargs)
+    echo "Found requirements in frontmatter of $file: $requirements"
     # Create a temporary requirements.txt file
-    local temp_requirements_file=$(mktemp)
+    local temp_requirements_file
+    temp_requirements_file=$(mktemp)
     echo "$requirements" | tr ' ' '\n' > "$temp_requirements_file"
-    install_requirements "$temp_requirements_file"
+    install_requirements "$temp_requirements_file" "$file"
     rm "$temp_requirements_file"
   else
     echo "No requirements found in frontmatter of $file."
@@ -155,10 +177,8 @@ if [[ -n "$PIPELINES_URLS" ]]; then
     done
   fi
 
-  for file in "$PIPELINES_DIR"/*; do
-    if [[ -f "$file" ]]; then
-      install_frontmatter_requirements "$file"
-    fi
+  find "$PIPELINES_DIR" -type f -name '*.py' | while read -r file; do
+    install_frontmatter_requirements "$file"
   done
 else
   echo "PIPELINES_URLS not specified. Skipping pipelines download and installation."
