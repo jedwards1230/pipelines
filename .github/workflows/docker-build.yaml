@@ -6,6 +6,7 @@ on:
         branches:
             - main
             - dev
+            - tweaks
 
 jobs:
     build-main-image:
@@ -16,6 +17,7 @@ jobs:
 
     build-cuda-image:
         uses: ./.github/workflows/build-docker-image.yaml
+        if: false
         with:
             image_name: ${{ github.repository }}
             cache_id: cuda
