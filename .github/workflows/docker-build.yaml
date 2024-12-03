@@ -3,9 +3,6 @@ name: Create and publish Docker images with specific build args
 on:
     workflow_dispatch:
     push:
-        branches:
-            - main
-            - dev
 
 jobs:
     build-main-image:
@@ -23,7 +20,7 @@ jobs:
             extract_flavor: suffix=-cuda,onlatest=true
             build_args: |
                 USE_CUDA=true
-    
+
     build-minimum-image:
         uses: ./.github/workflows/build-docker-image.yaml
         with:
