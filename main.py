@@ -1,20 +1,13 @@
+import io
 from fastapi import FastAPI, Request, Depends, status, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 
+from starlette.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import Generator, Iterator
 
-from starlette.responses import StreamingResponse, Response
-from pydantic import BaseModel, ConfigDict
-from typing import List, Union, Generator, Iterator
-
-
-from utils.pipelines.auth import bearer_security, get_current_user
-from utils.pipelines.main import get_last_user_message, stream_message_template
-from utils.pipelines.misc import convert_to_raw_url
-
-from contextlib import asynccontextmanager
-from concurrent.futures import ThreadPoolExecutor
-from schemas import FilterForm, OpenAIChatCompletionForm
+from contextlib import asynccontextmanager, redirect_stdout
 from urllib.parse import urlparse
 
 import shutil
@@ -29,10 +22,26 @@ import sys
 import subprocess
 
 
-from config import API_KEY, PIPELINES_DIR
+from utils.pipelines.auth import get_current_user
+from utils.pipelines.main import get_last_user_message, stream_message_template
+from utils.pipelines.misc import convert_to_raw_url
+
+from config import API_KEY, GLOBAL_LOG_LEVEL, PIPELINES_DIR, SRC_LOG_LEVELS
+from schemas import FilterForm, OpenAIChatCompletionForm
+
 
 if not os.path.exists(PIPELINES_DIR):
     os.makedirs(PIPELINES_DIR)
+
+logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
+logger = logging.getLogger(__name__)
+logger.setLevel(SRC_LOG_LEVELS["MAIN"])
+
+pipeline_logger = {
+    "pipe": logging.getLogger("pipe"),
+    "filter": logging.getLogger("filter"),
+    "manifold": logging.getLogger("manifold"),
+}
 
 
 PIPELINES = {}
@@ -120,14 +129,14 @@ def install_frontmatter_requirements(requirements):
     if requirements:
         req_list = [req.strip() for req in requirements.split(",")]
         for req in req_list:
-            print(f"Installing requirement: {req}")
+            logger.info(f"Installing requirement: {req}")
             subprocess.check_call([sys.executable, "-m", "pip", "install", req])
     else:
-        print("No requirements found in frontmatter.")
+        logger.debug("No requirements found in frontmatter.")
+
 
 
 async def load_module_from_path(module_name, module_path):
-
     try:
         # Read the module content
         with open(module_path, "r") as file:
@@ -149,13 +158,13 @@ async def load_module_from_path(module_name, module_path):
         spec = importlib.util.spec_from_file_location(module_name, module_path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        print(f"Loaded module: {module.__name__}")
+        logger.info(f"Loaded module: {module.__name__}")
         if hasattr(module, "Pipeline"):
             return module.Pipeline()
         else:
             raise Exception("No Pipeline class found")
     except Exception as e:
-        print(f"Error loading module: {module_name}")
+        logger.error(f"Error loading module: {module_name}")
 
         # Move the file to the error folder
         failed_pipelines_folder = os.path.join(PIPELINES_DIR, "failed")
@@ -164,7 +173,7 @@ async def load_module_from_path(module_name, module_path):
 
         failed_file_path = os.path.join(failed_pipelines_folder, f"{module_name}.py")
         os.rename(module_path, failed_file_path)
-        print(e)
+        logger.error(e)
     return None
 
 
@@ -181,14 +190,14 @@ async def load_modules_from_directory(directory):
             subfolder_path = os.path.join(directory, module_name)
             if not os.path.exists(subfolder_path):
                 os.makedirs(subfolder_path)
-                logging.info(f"Created subfolder: {subfolder_path}")
+                logger.info(f"Created subfolder: {subfolder_path}")
 
             # Create a valves.json file if it doesn't exist
             valves_json_path = os.path.join(subfolder_path, "valves.json")
             if not os.path.exists(valves_json_path):
                 with open(valves_json_path, "w") as f:
                     json.dump({}, f)
-                logging.info(f"Created valves.json in: {subfolder_path}")
+                logger.info(f"Created valves.json in: {subfolder_path}")
 
             pipeline = await load_module_from_path(module_name, module_path)
             if pipeline:
@@ -206,31 +215,46 @@ async def load_modules_from_directory(directory):
                             valves = ValvesModel(**combined_valves)
                             pipeline.valves = valves
 
-                            logging.info(f"Updated valves for module: {module_name}")
+                            logger.info(f"Updated valves for module: {module_name}")
 
-                pipeline_id = pipeline.id if hasattr(pipeline, "id") else module_name
-                PIPELINE_MODULES[pipeline_id] = pipeline
-                PIPELINE_NAMES[pipeline_id] = module_name
-                logging.info(f"Loaded module: {module_name}")
+                pipeline.id = pipeline.id if hasattr(pipeline, "id") else module_name
+                PIPELINE_MODULES[pipeline.id] = pipeline
+                PIPELINE_NAMES[pipeline.id] = module_name
+                logger.info(f"Loaded module: {module_name}")
             else:
-                logging.warning(f"No Pipeline class found in {module_name}")
+                logger.warning(f"No Pipeline class found in {module_name}")
 
     global PIPELINES
     PIPELINES = get_all_pipelines()
+
+
+async def run_pipeline_module_method(module_id, method_name, *args, **kwargs):
+    if module_id not in PIPELINE_MODULES:
+        raise Exception(f"Module {module_id} not found")
+
+    module = PIPELINE_MODULES[module_id]
+    if hasattr(module, method_name):
+        method = getattr(module, method_name)
+        f = io.StringIO()
+        with redirect_stdout(f):
+            await method(*args, **kwargs)
+        output = f.getvalue()
+        pipeline_logger[module.type.lower()].info(output)
+
+    else:
+        raise Exception(f"Method {method_name} not found in module {module_id}")
 
 
 async def on_startup():
     await load_modules_from_directory(PIPELINES_DIR)
 
     for module in PIPELINE_MODULES.values():
-        if hasattr(module, "on_startup"):
-            await module.on_startup()
+        await run_pipeline_module_method(module.id, "on_startup")
 
 
 async def on_shutdown():
     for module in PIPELINE_MODULES.values():
-        if hasattr(module, "on_shutdown"):
-            await module.on_shutdown()
+        await run_pipeline_module_method(module.id, "on_shutdown")
 
 
 async def reload():
@@ -394,7 +418,7 @@ async def add_pipeline(
     try:
         url = convert_to_raw_url(form_data.url)
 
-        print(url)
+        logger.debug(f"Downloading pipeline from {url}")
         file_path = await download_file(url, dest_folder=PIPELINES_DIR)
         await reload()
         return {
@@ -473,9 +497,7 @@ async def delete_pipeline(
     pipeline_id = form_data.id
     pipeline_name = PIPELINE_NAMES.get(pipeline_id.split(".")[0], None)
 
-    if PIPELINE_MODULES[pipeline_id]:
-        if hasattr(PIPELINE_MODULES[pipeline_id], "on_shutdown"):
-            await PIPELINE_MODULES[pipeline_id].on_shutdown()
+    await run_pipeline_module_method(pipeline_id, "on_shutdown")
 
     pipeline_path = os.path.join(PIPELINES_DIR, f"{pipeline_name}.py")
     if os.path.exists(pipeline_path):
@@ -576,10 +598,9 @@ async def update_valves(pipeline_id: str, form_data: dict):
         with open(valves_json_path, "w") as f:
             json.dump(valves.model_dump(), f)
 
-        if hasattr(pipeline, "on_valves_updated"):
-            await pipeline.on_valves_updated()
+        await run_pipeline_module_method(pipeline_id, "on_valves_updated")
     except Exception as e:
-        print(e)
+        logger.error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"{str(e)}",
@@ -608,12 +629,14 @@ async def filter_inlet(pipeline_id: str, form_data: FilterForm):
 
     try:
         if hasattr(pipeline, "inlet"):
-            body = await pipeline.inlet(form_data.body, form_data.user)
+            body = await run_pipeline_module_method(
+                pipeline_id, "inlet", form_data.body, form_data.user
+            )
             return body
         else:
             return form_data.body
     except Exception as e:
-        print(e)
+        logger.error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"{str(e)}",
@@ -640,12 +663,14 @@ async def filter_outlet(pipeline_id: str, form_data: FilterForm):
 
     try:
         if hasattr(pipeline, "outlet"):
-            body = await pipeline.outlet(form_data.body, form_data.user)
+            body = await run_pipeline_module_method(
+                pipeline_id, "outlet", form_data.body, form_data.user
+            )
             return body
         else:
             return form_data.body
     except Exception as e:
-        print(e)
+        logger.error(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"{str(e)}",
@@ -668,12 +693,12 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
         )
 
     def job():
-        print(form_data.model)
+        logger.info(f"Processing pipeline: {form_data.model}")
 
         pipeline = app.state.PIPELINES[form_data.model]
         pipeline_id = form_data.model
 
-        print(pipeline_id)
+        logger.info(f"Found {pipeline_id} for {form_data.model}")
 
         if pipeline["type"] == "manifold":
             manifold_id, pipeline_id = pipeline_id.split(".", 1)
@@ -690,12 +715,20 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                     messages=messages,
                     body=form_data.model_dump(),
                 )
+                # run_pipeline_module_method(
+                #     pipeline_id,
+                #     "pipe",
+                #     user_message=user_message,
+                #     model_id=pipeline_id,
+                #     messages=messages,
+                #     body=form_data.model_dump(),
+                # )
 
-                logging.info(f"stream:true:{res}")
+                logger.debug(f"stream:true:{res}")
 
                 if isinstance(res, str):
                     message = stream_message_template(form_data.model, res)
-                    logging.info(f"stream_content:str:{message}")
+                    logger.debug(f"stream_content:str:{message}")
                     yield f"data: {json.dumps(message)}\n\n"
 
                 if isinstance(res, Iterator):
@@ -709,7 +742,7 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                         except:
                             pass
 
-                        logging.info(f"stream_content:Generator:{line}")
+                        logger.debug(f"stream_content:Generator:{line}")
 
                         if line.startswith("data:"):
                             yield f"{line}\n\n"
@@ -744,7 +777,7 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                 messages=messages,
                 body=form_data.model_dump(),
             )
-            logging.info(f"stream:false:{res}")
+            logger.debug(f"stream:false:{res}")
 
             if isinstance(res, dict):
                 return res
@@ -761,7 +794,7 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                     for stream in res:
                         message = f"{message}{stream}"
 
-                logging.info(f"stream:false:{message}")
+                logger.debug(f"stream:false:{message}")
                 return {
                     "id": f"{form_data.model}-{str(uuid.uuid4())}",
                     "object": "chat.completion",

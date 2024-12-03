@@ -9,11 +9,7 @@ from typing import Union, Optional
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 import jwt
-import logging
 import os
-
-import requests
-import uuid
 
 
 from config import API_KEY, PIPELINES_DIR
